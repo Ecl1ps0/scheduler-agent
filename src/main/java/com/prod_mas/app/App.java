@@ -29,7 +29,7 @@ public class App {
             String host;
             try {
                 host = InetAddress.getLocalHost().getHostAddress();
-                System.setProperty("main_host", host);
+                System.setProperty("MAIN_HOST", host);
             } catch (Exception e) {
                 host = "127.0.0.1";
             }

@@ -17,7 +17,7 @@ import java.util.Map;
 
 public class Scheduler extends Agent {
     private boolean taskSent = false;
-    private String pendingTask = String.format("http://%s:8080/files/xgboost.py", System.getProperty("main_host"));
+    private String pendingTask = String.format("http://%s:8080/files/main_100.exe", System.getProperty("MAIN_HOST"));
     private final Map<AID, BigDecimal> workloadMap = new HashMap<>();
     private int repliesExpected = 0;
 
@@ -30,6 +30,8 @@ public class Scheduler extends Agent {
                     stop();
                     return;
                 }
+
+                System.out.println(pendingTask);
 
                 try {
                     DFAgentDescription template = new DFAgentDescription();
