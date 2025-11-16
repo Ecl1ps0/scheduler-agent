@@ -21,3 +21,4 @@ buildNumber.properties
 .code-workspace
 /upload
 /checkpoints
+/training_results.*

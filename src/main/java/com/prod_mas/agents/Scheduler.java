@@ -11,27 +11,72 @@ import jade.domain.FIPAException;
 import jade.lang.acl.ACLMessage;
 
 import java.math.BigDecimal;
-import java.util.Comparator;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedList;
+import java.util.List;
 import java.util.Map;
+import java.util.Queue;
+
+import com.prod_mas.utils.ExcelWriter;
+
+import java.util.Map.Entry;
 
 public class Scheduler extends Agent {
-    private boolean taskSent = false;
-    private String pendingTask = String.format("http://%s:8080/files/main_100.exe", System.getProperty("MAIN_HOST"));
+    private final Queue<String> pendingTasks = new LinkedList<>();
+    private final Map<AID, String> workerTaskMap = new HashMap<>();
+    private final Map<AID, Instant> workerHeartbeatMap = new HashMap<>();
     private final Map<AID, BigDecimal> workloadMap = new HashMap<>();
-    private int repliesExpected = 0;
+    private final Map<String, List<Double>> modelTimingData = new HashMap<>();
+    private final int HEALTH_CHECK_TIMEOUT = 30;
+    private final int HEALTH_CHECK_INTERVAL = 5000;
+    private Instant firstAssignmentTime = null;
+    private Instant allTasksCompletedTime = null;
 
     @Override
     protected void setup() {
+
+        String host = System.getProperty("MAIN_HOST");
+
+        String[] models = new String[] {
+            "catboost_model.exe",
+            "random_forest.exe",
+            "xgboost.exe"
+        };
+
+        int TOTAL_TASKS = 100;
+
+        Map<String, Integer> modelCounts = new HashMap<>();
+        for (String m : models) {
+            modelCounts.put(m, 0);
+        }
+
+        for (int i = 0; i < TOTAL_TASKS; i++) {
+            String model = models[i % models.length];
+            String url = String.format("http://%s:8080/files/%s", host, model);
+            pendingTasks.add(url);
+            modelCounts.put(model, modelCounts.get(model) + 1);
+        }
+
+        System.out.println("Loaded " + pendingTasks.size() + " tasks into queue!");
+
+        System.out.println("Model distribution:");
+        for (Map.Entry<String, Integer> entry : modelCounts.entrySet()) {
+            System.out.println(entry.getKey() + " → " + entry.getValue());
+        }
+
+        for (String m : models) {
+            modelTimingData.put(m, new ArrayList<>());
+        }
+
         addBehaviour(new TickerBehaviour(this, 10000) {
             @Override
             protected void onTick() {
-                if (taskSent || pendingTask == null) {
-                    stop();
+                if (pendingTasks.isEmpty()) {
                     return;
                 }
-
-                System.out.println(pendingTask);
 
                 try {
                     DFAgentDescription template = new DFAgentDescription();
@@ -47,17 +92,18 @@ public class Scheduler extends Agent {
                     }
 
                     workloadMap.clear();
-                    repliesExpected = result.length;
 
                     for (DFAgentDescription desc : result) {
                         AID worker = desc.getName();
-                        ACLMessage req = new ACLMessage(ACLMessage.QUERY_IF);
-                        req.addReceiver(worker);
-                        req.setContent("Workload?");
-                        send(req);
-                    }
 
-                    System.out.println("Sent workload requests to " + repliesExpected + " workers.");
+                        // Only request workload if worker is free
+                        if (!workerTaskMap.containsKey(worker)) {
+                            ACLMessage req = new ACLMessage(ACLMessage.QUERY_IF);
+                            req.addReceiver(worker);
+                            req.setContent("Workload?");
+                            send(req);
+                        }
+                    }
 
                 } catch (FIPAException fe) {
                     fe.printStackTrace();
@@ -65,43 +111,119 @@ public class Scheduler extends Agent {
             }
         });
 
-        // 2) Collect replies asynchronously
+        // 2) Collect replies and assign tasks
         addBehaviour(new CyclicBehaviour() {
             @Override
             public void action() {
                 ACLMessage msg = receive();
                 if (msg != null) {
-                    if (msg.getPerformative() == ACLMessage.INFORM) {
-                        try {
-                            var load = new BigDecimal(msg.getContent());
-                            workloadMap.put(msg.getSender(), load);
-                            System.out.println("Worker " + msg.getSender().getLocalName() + " load=" + load);
 
-                            // once all replies collected → assign
-                            if (workloadMap.size() == repliesExpected && !workloadMap.isEmpty() && pendingTask != null) {
-                                AID chosen = workloadMap.entrySet().stream()
-                                        .min(Comparator.comparing(Map.Entry::getValue))
-                                        .map(Map.Entry::getKey)
-                                        .orElse(null);
+                    AID sender = msg.getSender();
 
-                                if (chosen != null) {
+                    switch (msg.getPerformative()) {
+                        case ACLMessage.INFORM:
+                            try {
+                                BigDecimal load = new BigDecimal(msg.getContent());
+                                workloadMap.put(sender, load);
+                                workerHeartbeatMap.put(sender, Instant.now());
+
+                                System.out.println("Worker " + sender.getLocalName() + " load=" + load);
+
+                                // Assign task if worker is free
+                                if (!workerTaskMap.containsKey(sender) && !pendingTasks.isEmpty()) {
+                                    if (firstAssignmentTime == null) {
+                                        firstAssignmentTime = Instant.now();
+                                    }
+                                    
+                                    String taskToAssign = pendingTasks.poll();
                                     ACLMessage assign = new ACLMessage(ACLMessage.REQUEST);
-                                    assign.addReceiver(chosen);
-                                    assign.setContent(pendingTask);
+                                    assign.addReceiver(sender);
+                                    assign.setContent(taskToAssign);
                                     send(assign);
 
-                                    System.out.println("Assigned task to " + chosen.getLocalName());
-                                    taskSent = true;
-                                    pendingTask = null;
+                                    workerTaskMap.put(sender, taskToAssign);
+                                    workerHeartbeatMap.put(sender, Instant.now());
+
+                                    System.out.println("Assigned task " + taskToAssign + " to " + sender.getLocalName());
+                                }
+
+                            } catch (NumberFormatException ignored) {
+                                System.out.println("Invalid workload reply: " + msg.getContent());
+                            }
+                            break;
+
+                        case ACLMessage.CONFIRM:
+                            // Worker completed a task
+                            String[] parts = msg.getContent().split("\\|");
+
+                            String completedTask = parts[0];
+                            double durationMs = Double.parseDouble(parts[1]);
+
+                            workerTaskMap.remove(sender);
+                            workerHeartbeatMap.remove(sender);
+
+                            String modelName = completedTask.substring(completedTask.lastIndexOf('/') + 1);
+                            modelTimingData.get(modelName).add(durationMs);
+
+                            System.out.println(
+                                "Worker " + sender.getLocalName() +
+                                " completed task " + modelName +
+                                " in " + durationMs + " ms"
+                            );
+
+                            ExcelWriter.appendTrainingResult("training_results.xlsx", modelName, durationMs);
+
+                            if (pendingTasks.isEmpty() && workerTaskMap.isEmpty()) {
+                                allTasksCompletedTime = Instant.now();
+                                long seconds = Duration.between(firstAssignmentTime, allTasksCompletedTime).toSeconds();
+
+                                System.out.println("All tasks completed!");
+                                System.out.println("Total processing time: " + seconds + " seconds");
+
+                                System.out.println("\n=== Average times per model ===");
+
+                                for (var e : modelTimingData.entrySet()) {
+                                    List<Double> times = e.getValue();
+                                    double avg = (long) times.stream().mapToDouble(Double::doubleValue).average().orElse(0);
+                                    System.out.println(e.getKey() + " → " + avg + " ms");
                                 }
                             }
-
-                        } catch (NumberFormatException ignored) {
-                            System.out.println("Invalid workload reply: " + msg.getContent());
-                        }
+                            break;
                     }
-                } else {
-                    block();
+                }
+            }
+        });
+
+        // 3) Periodic health check for workers that are currently busy
+        addBehaviour(new TickerBehaviour(this, HEALTH_CHECK_INTERVAL) {
+            @Override
+            protected void onTick() {
+                Instant now = Instant.now();
+                List<AID> workersToRemove = new ArrayList<>();
+
+                for (Map.Entry<AID, String> entry : workerTaskMap.entrySet()) {
+                    AID worker = entry.getKey();
+                    String task = entry.getValue();
+                    Instant lastHeartbeat = workerHeartbeatMap.getOrDefault(worker, Instant.EPOCH);
+
+                    if (now.getEpochSecond() - lastHeartbeat.getEpochSecond() > HEALTH_CHECK_TIMEOUT) {
+                        // Worker unresponsive → reassign task
+                        System.out.println("Worker " + worker.getLocalName() + " unresponsive. Reassigning task " + task);
+                        pendingTasks.add(task);
+                        workersToRemove.add(worker);
+                        workerHeartbeatMap.remove(worker);
+                    } else {
+                        // Send heartbeat check
+                        ACLMessage heartbeat = new ACLMessage(ACLMessage.QUERY_IF);
+                        heartbeat.addReceiver(worker);
+                        heartbeat.setContent("Are you alive?");
+                        send(heartbeat);
+                    }
+                }
+
+                // Remove unresponsive workers from task map
+                for (AID w : workersToRemove) {
+                    workerTaskMap.remove(w);
                 }
             }
         });
