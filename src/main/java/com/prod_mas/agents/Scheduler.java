@@ -22,28 +22,24 @@ import java.util.Queue;
 
 import com.prod_mas.utils.ExcelWriter;
 
-import java.util.Map.Entry;
-
 public class Scheduler extends Agent {
     private final Queue<String> pendingTasks = new LinkedList<>();
     private final Map<AID, String> workerTaskMap = new HashMap<>();
     private final Map<AID, Instant> workerHeartbeatMap = new HashMap<>();
-    private final Map<AID, BigDecimal> workloadMap = new HashMap<>();
     private final Map<String, List<Double>> modelTimingData = new HashMap<>();
     private final int HEALTH_CHECK_TIMEOUT = 30;
     private final int HEALTH_CHECK_INTERVAL = 5000;
     private Instant firstAssignmentTime = null;
     private Instant allTasksCompletedTime = null;
+    private final String host = System.getProperty("MAIN_HOST");// NEW
 
     @Override
     protected void setup() {
 
-        String host = System.getProperty("MAIN_HOST");
-
         String[] models = new String[] {
-            "catboost_model.exe",
-            "random_forest.exe",
-            "xgboost.exe"
+            "catboost_model",
+            "random_forest",
+            "xgboost"
         };
 
         int TOTAL_TASKS = 100;
@@ -55,8 +51,8 @@ public class Scheduler extends Agent {
 
         for (int i = 0; i < TOTAL_TASKS; i++) {
             String model = models[i % models.length];
-            String url = String.format("http://%s:8080/files/%s", host, model);
-            pendingTasks.add(url);
+//            String url = String.format("http://%s:8080/files/%s", host, model);
+            pendingTasks.add(model);
             modelCounts.put(model, modelCounts.get(model) + 1);
         }
 
@@ -91,8 +87,6 @@ public class Scheduler extends Agent {
                         return;
                     }
 
-                    workloadMap.clear();
-
                     for (DFAgentDescription desc : result) {
                         AID worker = desc.getName();
 
@@ -123,8 +117,10 @@ public class Scheduler extends Agent {
                     switch (msg.getPerformative()) {
                         case ACLMessage.INFORM:
                             try {
-                                BigDecimal load = new BigDecimal(msg.getContent());
-                                workloadMap.put(sender, load);
+                                var message = msg.getContent();
+                                var splitMessage = message.split("\\|");
+                                var os = splitMessage[0];
+                                BigDecimal load = new BigDecimal(splitMessage[1]);
                                 workerHeartbeatMap.put(sender, Instant.now());
 
                                 System.out.println("Worker " + sender.getLocalName() + " load=" + load);
@@ -135,7 +131,7 @@ public class Scheduler extends Agent {
                                         firstAssignmentTime = Instant.now();
                                     }
                                     
-                                    String taskToAssign = pendingTasks.poll();
+                                    String taskToAssign = buildTaskUrl(pendingTasks.poll(), os);
                                     ACLMessage assign = new ACLMessage(ACLMessage.REQUEST);
                                     assign.addReceiver(sender);
                                     assign.setContent(taskToAssign);
@@ -163,6 +159,8 @@ public class Scheduler extends Agent {
                             workerHeartbeatMap.remove(sender);
 
                             String modelName = completedTask.substring(completedTask.lastIndexOf('/') + 1);
+                            modelName = modelName.replace(".exe", "");
+                            modelName = modelName.replace(".bin", "");
                             modelTimingData.get(modelName).add(durationMs);
 
                             System.out.println(
@@ -208,7 +206,11 @@ public class Scheduler extends Agent {
 
                     if (now.getEpochSecond() - lastHeartbeat.getEpochSecond() > HEALTH_CHECK_TIMEOUT) {
                         // Worker unresponsive → reassign task
+                        task = task.substring(task.lastIndexOf('/') + 1);
+                        task = task.replace(".exe", "");
+                        task = task.replace(".bin", "");
                         System.out.println("Worker " + worker.getLocalName() + " unresponsive. Reassigning task " + task);
+
                         pendingTasks.add(task);
                         workersToRemove.add(worker);
                         workerHeartbeatMap.remove(worker);
@@ -227,5 +229,13 @@ public class Scheduler extends Agent {
                 }
             }
         });
+    }
+
+    private String buildTaskUrl(String modelFileName, String workerOs) {
+        if (workerOs != null && workerOs.contains("mac")) {
+            return String.format("http://%s:8080/files/mac/%s.bin", host, modelFileName);
+        }
+
+        return String.format("http://%s:8080/files/%s.exe", host, modelFileName);
     }
 }

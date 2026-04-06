@@ -4,6 +4,7 @@
 *.ear
 *.nar
 *.exe
+*.bin
 hs_err_pid*
 replay_pid*
 target/
